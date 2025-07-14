@@ -38,7 +38,7 @@ class Game:
         self.registry = Registry()
         self.save_manager = SaveManager()
         self.input_handler = InputHandler()
-        self.renderer = TerminalRenderer(viewport_width=40, viewport_height=20)
+        self.renderer = TerminalRenderer()  # Auto-detect terminal size
         
         # Initialize world
         self.seed = seed or int(time.time())
@@ -128,6 +128,7 @@ class Game:
         print(f"Seed: {self.seed}")
         print(f"Macro Map: {self.macro_map.width}x{self.macro_map.height}")
         print(f"Chunk Size: {self.map_generator.chunk_size}x{self.map_generator.chunk_size}")
+        print(f"Viewport: {self.renderer.viewport_width}x{self.renderer.viewport_height}")
         print()
         self.input_handler.print_help()
         print()

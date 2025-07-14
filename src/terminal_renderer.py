@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 
@@ -17,7 +18,15 @@ class RenderData:
 
 
 class TerminalRenderer:
-    def __init__(self, viewport_width: int = 40, viewport_height: int = 20):
+    def __init__(self, viewport_width: int = None, viewport_height: int = None):
+        # Detect terminal size if not provided
+        if viewport_width is None or viewport_height is None:
+            term_size = self._get_terminal_size()
+            if viewport_width is None:
+                viewport_width = term_size[0]
+            if viewport_height is None:
+                viewport_height = term_size[1]
+        
         self.viewport_width = viewport_width
         self.viewport_height = viewport_height
         self.hud_height = 5
@@ -33,6 +42,36 @@ class TerminalRenderer:
         # Clear screen and setup
         self._clear_screen()
         self._hide_cursor()
+        
+        # Print initialization info
+        print(f"Terminal Renderer initialized: {self.viewport_width}x{self.viewport_height} viewport")
+    
+    def resize_if_needed(self):
+        """Check if terminal has been resized and update accordingly"""
+        try:
+            new_width, new_height = self._get_terminal_size()
+            if (new_width != self.viewport_width or new_height != self.viewport_height):
+                self.viewport_width = new_width
+                self.viewport_height = new_height
+                self.total_height = new_height + self.hud_height
+                self._clear_screen()
+                print(f"Terminal resized to: {self.viewport_width}x{self.viewport_height}")
+                return True
+        except Exception:
+            pass
+        return False
+    
+    def _get_terminal_size(self) -> Tuple[int, int]:
+        """Get current terminal size, with fallback to defaults"""
+        try:
+            size = shutil.get_terminal_size()
+            # Reserve space for HUD (5 lines) and some padding
+            usable_height = max(10, size.lines - 7)  # Minimum 10 lines, leave 7 for HUD and padding
+            usable_width = max(40, size.columns - 2)  # Minimum 40 chars, leave 2 for borders
+            return usable_width, usable_height
+        except Exception:
+            # Fallback to original size if detection fails
+            return 40, 20
     
     def _detect_color_support(self) -> bool:
         """Detect if terminal supports ANSI colors"""
@@ -232,39 +271,100 @@ class TerminalRenderer:
         """Render the macro map view with cursor"""
         self._move_cursor(0, 0)
         
-        # Clear screen
+        # Clear screen using actual viewport width
         for y in range(self.total_height):
             self._move_cursor(0, y)
-            print(' ' * 80, flush=True)
+            print(' ' * self.viewport_width, flush=True)
         
-        # Render macro map
+        # Calculate scaling and centering
+        scale_x, scale_y, offset_x, offset_y = self._calculate_macro_scaling(macro_map)
+        
+        # Render macro map title
         self._move_cursor(0, 0)
-        print(f'Macro Map View ({macro_map.width}x{macro_map.height})', flush=True)
+        title = f'Macro Map View ({macro_map.width}x{macro_map.height}) - Scale: {scale_x}x{scale_y}'
+        print(title, flush=True)
         
-        for y in range(min(macro_map.height, self.viewport_height - 2)):
-            self._move_cursor(0, y + 1)
-            row = ""
-            for x in range(min(macro_map.width, self.viewport_width)):
-                cell = macro_map.get_cell(x, y)
-                if cell:
-                    glyph = '~' if cell.biome == BiomeType.OCEAN else '.'
-                    if cell.biome in [BiomeType.HILLS, BiomeType.MOUNTAINS]:
-                        glyph = '^' if cell.biome == BiomeType.HILLS else 'M'
-                    elif cell.biome == BiomeType.FOREST:
-                        glyph = 'T'
-                    elif cell.biome == BiomeType.SWAMP:
-                        glyph = 'S'
+        # Render the scaled macro map
+        for screen_y in range(offset_y, min(self.viewport_height - 2, offset_y + macro_map.height * scale_y)):
+            self._move_cursor(0, screen_y + 1)
+            row = " " * offset_x  # Left padding
+            visual_width = offset_x  # Track actual visual width (without ANSI codes)
+            
+            for world_x in range(macro_map.width):
+                # Check if we have room for this cell's scaled width
+                if visual_width + scale_x > self.viewport_width:
+                    break
                     
-                    # Highlight cursor position
-                    if x == cursor_x and y == cursor_y:
-                        row += f'\033[7m{glyph}\033[0m'  # Reverse video
+                world_y = (screen_y - offset_y) // scale_y
+                if 0 <= world_y < macro_map.height:
+                    cell = macro_map.get_cell(world_x, world_y)
+                    if cell:
+                        glyph = self._get_macro_glyph(cell)
+                        
+                        # Highlight cursor position
+                        if world_x == cursor_x and world_y == cursor_y:
+                            glyph_display = f'\033[7m{glyph}\033[0m'  # Reverse video
+                        else:
+                            color = get_default_color_for_biome(cell.biome)
+                            glyph_display = f'\033[{color}m{glyph}\033[0m'
+                        
+                        # Add scaling (repeat glyph if scale > 1)
+                        for sx in range(scale_x):
+                            row += glyph_display
+                        visual_width += scale_x
                     else:
-                        color = get_default_color_for_biome(cell.biome)
-                        row += f'\033[{color}m{glyph}\033[0m'
-                else:
-                    row += ' '
+                        # Empty cell
+                        row += ' ' * scale_x
+                        visual_width += scale_x
+            
             print(row, flush=True)
         
+        # Render macro HUD
+        self.render_macro_hud(macro_map, cursor_x, cursor_y)
+    
+    def _calculate_macro_scaling(self, macro_map):
+        """Calculate scaling and centering for macro map"""
+        # Calculate maximum scale that fits in viewport
+        max_scale_x = max(1, (self.viewport_width - 4) // macro_map.width)
+        max_scale_y = max(1, (self.viewport_height - 4) // macro_map.height)
+        
+        # Use the smaller scale to maintain aspect ratio
+        scale = min(max_scale_x, max_scale_y)
+        scale_x = scale_y = scale
+        
+        # Calculate centering offsets
+        total_width = macro_map.width * scale_x
+        total_height = macro_map.height * scale_y
+        offset_x = max(0, (self.viewport_width - total_width) // 2)
+        offset_y = max(0, (self.viewport_height - total_height - 2) // 2)  # -2 for title
+        
+        return scale_x, scale_y, offset_x, offset_y
+    
+    def _get_macro_glyph(self, cell):
+        """Get the appropriate glyph for a macro cell"""
+        if cell.biome == BiomeType.OCEAN:
+            return '~'
+        elif cell.biome == BiomeType.BEACH:
+            return '.'
+        elif cell.biome == BiomeType.HILLS:
+            return '^'
+        elif cell.biome == BiomeType.MOUNTAINS:
+            return 'M'
+        elif cell.biome == BiomeType.FOREST:
+            return 'T'
+        elif cell.biome == BiomeType.SWAMP:
+            return 'S'
+        elif cell.biome == BiomeType.DESERT:
+            return '~'
+        elif cell.biome == BiomeType.TUNDRA:
+            return '.'
+        elif cell.biome == BiomeType.TAIGA:
+            return 'T'
+        else:
+            return '.'
+    
+    def render_macro_hud(self, macro_map, cursor_x: int, cursor_y: int):
+        """Render the macro mode HUD"""
         # Render macro HUD
         hud_start_y = self.viewport_height
         self._move_cursor(0, hud_start_y)
@@ -276,7 +376,10 @@ class TerminalRenderer:
         self._move_cursor(0, hud_start_y + 2)
         selected_cell = macro_map.get_cell(cursor_x, cursor_y)
         if selected_cell:
-            print(f'Cell: {selected_cell.biome.value.title()}', flush=True)
+            cell_info = f'Cell: {selected_cell.biome.value.title()}'
+            if hasattr(selected_cell, 'elevation'):
+                cell_info += f' (E:{selected_cell.elevation:.2f})'
+            print(cell_info, flush=True)
         
         self._move_cursor(0, hud_start_y + 3)
         print('Mode: macro | WASD: Move Cursor | M: Enter Micro | Q: Quit', flush=True)
